@@ -1,0 +1,25 @@
+# SAM build ignore file
+# Excludes development, test, and frontend assets from Lambda deployment packages
+
+web/
+tests/
+scripts/
+demo/
+onboarding/
+docs/
+.git/
+.github/
+.venv/
+venv/
+env/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.coverage
+htmlcov/
+.DS_Store
+Thumbs.db
+requirements-dev.txt
+samconfig.toml

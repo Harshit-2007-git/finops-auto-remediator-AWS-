@@ -1,0 +1,653 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Closed-Loop FinOps Auto-Remediation on AWS
+  Demo tenant: PixelForge Studios
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 256
+    Environment:
+      Variables:
+        COMPANY: pixelforge
+        DRY_RUN: 'true'
+        DEMO_MODE: 'true'
+        SCOPE_TAG_KEY: Project
+        SCOPE_TAG_VALUE: finops-demo
+        EC2_CPU_THRESHOLD: '5.0'
+        EC2_IDLE_WINDOW_DAYS: '7'
+        EBS_UNATTACHED_DAYS: '30'
+        DEMO_EC2_IDLE_MINUTES: '60'
+        DEMO_EBS_UNATTACHED_MINUTES: '120'
+        MAX_REMEDIATIONS_PER_RUN: '5'
+        AUDIT_TABLE_NAME: !Ref AuditTable
+        KMS_KEY_ALIAS: !Sub "alias/${KMSKeyAliasName}"
+        SNS_TOPIC_ARN: !Ref EscalationTopic
+        HMAC_PARAM_NAME: /finops/hmac-secret
+
+Parameters:
+  KMSKeyAliasName:
+    Type: String
+    Default: finops-key
+    Description: KMS Key Alias name suffix
+
+  EscalationEmail:
+    Type: String
+    Description: Operational email address for escalation notifications (required)
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # DynamoDB Audit Log Table (Provisioned 5 RCU / 5 WCU with CMK SSE)
+  # ---------------------------------------------------------------------------
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: finops-audit-log
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: log_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+        - AttributeName: log_id
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !GetAtt FinOpsKey.Arn
+      Tags:
+        - Key: Project
+          Value: finops-demo
+
+  # ---------------------------------------------------------------------------
+  # KMS Customer Managed Key for Envelope Encryption
+  # ---------------------------------------------------------------------------
+  FinOpsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS CMK for FinOps Audit Log AES-256-GCM Envelope Encryption
+      EnableKeyRotation: false
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: finops-key-policy
+        Statement:
+          - Sid: EnableIAMDelegationAndRootAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowSNSAndDynamoDBSSE
+            Effect: Allow
+            Principal:
+              Service:
+                - sns.amazonaws.com
+                - dynamodb.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+              - kms:Encrypt
+            Resource: '*'
+          - Sid: AllowCloudWatchAlarmsToPublishToEncryptedTopic
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: finops-demo
+
+  FinOpsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${KMSKeyAliasName}"
+      TargetKeyId: !Ref FinOpsKey
+
+  # ---------------------------------------------------------------------------
+  # SNS Topic and Subscription for Escalations
+  # ---------------------------------------------------------------------------
+  EscalationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: finops-escalation-topic
+      DisplayName: FinOps Remediation Escalation Topic
+      KmsMasterKeyId: !Ref FinOpsKey
+      Tags:
+        - Key: Project
+          Value: finops-demo
+
+  EscalationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref EscalationTopic
+      Protocol: email
+      Endpoint: !Ref EscalationEmail
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Groups (7-day retention to prevent runaway costs)
+  # ---------------------------------------------------------------------------
+  ScannerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/finops-scanner
+      RetentionInDays: 7
+
+  RemediatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/finops-remediator
+      RetentionInDays: 7
+
+  EscalatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/finops-escalator
+      RetentionInDays: 7
+
+  ApproverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/finops-approver
+      RetentionInDays: 7
+
+  # ---------------------------------------------------------------------------
+  # Lambda Functions
+  # ---------------------------------------------------------------------------
+  ScannerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ScannerLogGroup
+    Properties:
+      FunctionName: finops-scanner
+      Description: Scans AWS account for idle EC2 and unattached EBS resources
+      CodeUri: .
+      Handler: src.scanner.app.handler
+      Environment:
+        Variables:
+          APPROVAL_URL_BASE: !GetAtt ApprovalFunctionUrl.FunctionUrl
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt EscalationTopic.TopicName
+        - SSMParameterReadPolicy:
+            ParameterName: finops/hmac-secret
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:DescribeVolumes
+                - cloudwatch:GetMetricStatistics
+                - cloudwatch:GetMetricData
+                - cloudwatch:PutMetricData
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - ec2:StopInstances
+                - ec2:DeleteVolume
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/Project: finops-demo
+            - Effect: Allow
+              Action:
+                - ec2:CreateSnapshot
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*'
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/Project: finops-demo
+            - Effect: Allow
+              Action:
+                - ec2:CreateSnapshot
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*'
+            - Effect: Allow
+              Action:
+                - ec2:CreateTags
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/Project: finops-demo
+            - Effect: Allow
+              Action:
+                - ec2:CreateTags
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*'
+              Condition:
+                StringEquals:
+                  ec2:CreateAction: CreateSnapshot
+            - Effect: Allow
+              Action:
+                - kms:GenerateDataKey*
+                - kms:Encrypt
+              Resource: !GetAtt FinOpsKey.Arn
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:DescribeKey
+              Resource: !GetAtt FinOpsKey.Arn
+              Condition:
+                StringEquals:
+                  kms:ViaService:
+                    - !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+                    - !Sub 'sns.${AWS::Region}.amazonaws.com'
+
+  RemediationFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: RemediatorLogGroup
+    Properties:
+      FunctionName: finops-remediator
+      Description: Executes automated remediation actions (stop EC2, snapshot & delete EBS)
+      CodeUri: .
+      Handler: src.remediation.handler.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:GenerateDataKey*
+                - kms:Encrypt
+              Resource: !GetAtt FinOpsKey.Arn
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:DescribeKey
+              Resource: !GetAtt FinOpsKey.Arn
+              Condition:
+                StringEquals:
+                  kms:ViaService:
+                    - !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+                    - !Sub 'sns.${AWS::Region}.amazonaws.com'
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:DescribeVolumes
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - ec2:StopInstances
+                - ec2:DeleteVolume
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/Project: finops-demo
+            - Effect: Allow
+              Action:
+                - ec2:CreateSnapshot
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*'
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/Project: finops-demo
+            - Effect: Allow
+              Action:
+                - ec2:CreateSnapshot
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*'
+            - Effect: Allow
+              Action:
+                - ec2:CreateTags
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/Project: finops-demo
+            - Effect: Allow
+              Action:
+                - ec2:CreateTags
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*'
+              Condition:
+                StringEquals:
+                  ec2:CreateAction: CreateSnapshot
+
+  EscalationFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: EscalatorLogGroup
+    Properties:
+      FunctionName: finops-escalator
+      Description: Sends escalation emails via SNS with HMAC-signed approval links
+      CodeUri: .
+      Handler: src.escalation.handler.handler
+      Environment:
+        Variables:
+          APPROVAL_URL_BASE: !GetAtt ApprovalFunctionUrl.FunctionUrl
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt EscalationTopic.TopicName
+        - SSMParameterReadPolicy:
+            ParameterName: finops/hmac-secret
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:GenerateDataKey*
+                - kms:Encrypt
+              Resource: !GetAtt FinOpsKey.Arn
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:DescribeKey
+              Resource: !GetAtt FinOpsKey.Arn
+              Condition:
+                StringEquals:
+                  kms:ViaService:
+                    - !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+                    - !Sub 'sns.${AWS::Region}.amazonaws.com'
+
+  ApprovalFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ApproverLogGroup
+    Properties:
+      FunctionName: finops-approver
+      Description: Validates HMAC signed approval links and triggers remediation
+      CodeUri: .
+      Handler: src.approval.handler.handler
+      FunctionUrlConfig:
+        AuthType: NONE
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: finops/hmac-secret
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:GenerateDataKey*
+                - kms:Encrypt
+              Resource: !GetAtt FinOpsKey.Arn
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:DescribeKey
+              Resource: !GetAtt FinOpsKey.Arn
+              Condition:
+                StringEquals:
+                  kms:ViaService:
+                    - !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+                    - !Sub 'sns.${AWS::Region}.amazonaws.com'
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:DescribeVolumes
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - ec2:StopInstances
+                - ec2:DeleteVolume
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/Project: finops-demo
+            - Effect: Allow
+              Action:
+                - ec2:CreateSnapshot
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*'
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/Project: finops-demo
+            - Effect: Allow
+              Action:
+                - ec2:CreateSnapshot
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*'
+            - Effect: Allow
+              Action:
+                - ec2:CreateTags
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/Project: finops-demo
+            - Effect: Allow
+              Action:
+                - ec2:CreateTags
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*'
+              Condition:
+                StringEquals:
+                  ec2:CreateAction: CreateSnapshot
+
+  # ---------------------------------------------------------------------------
+  # EventBridge Schedule Rule
+  # ---------------------------------------------------------------------------
+  ScheduledScanRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: finops-scheduled-scan
+      Description: Triggers the FinOps scanner Lambda function daily
+      ScheduleExpression: "rate(1 day)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ScannerFunction.Arn
+          Id: ScannerFunctionTarget
+
+  PermissionForEventsToInvokeScanner:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScannerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledScanRule.Arn
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Alarms (Observability & Circuit Breaker Guardrails)
+  # ---------------------------------------------------------------------------
+  RemediationFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: FinOps-RemediationFailures
+      AlarmDescription: Triggered when automated remediation actions fail
+      Namespace: FinOps
+      MetricName: RemediationFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref EscalationTopic
+
+  CircuitBreakerTrippedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: FinOps-CircuitBreakerTripped
+      AlarmDescription: Triggered when auto-remediations reach the safety limit (5 actions/run)
+      Namespace: FinOps
+      MetricName: AutoRemediatedActions
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref EscalationTopic
+
+  ScannerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: FinOps-ScannerErrors
+      AlarmDescription: Triggered when Scanner Lambda encounters runtime execution errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ScannerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref EscalationTopic
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch FinOps Observability Dashboard
+  # ---------------------------------------------------------------------------
+  FinOpsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: FinOps-AutoRemediation-Dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "FinOps", "IdleEC2Detected" ],
+                  [ ".", "UnattachedEBSDetected" ],
+                  [ ".", "AutoRemediatedActions" ],
+                  [ ".", "EscalatedActions" ],
+                  [ ".", "RemediationFailures" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Wasted Resources & Auto Actions"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "FinOps", "EstimatedMonthlySavings" ],
+                  [ ".", "RealizedMonthlySavings" ]
+                ],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "Monthly FinOps Cost Savings ($)"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "finops-scanner" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", "FunctionName", "finops-remediator" ],
+                  [ ".", "Invocations", "FunctionName", "finops-escalator" ]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "title": "FinOps Pipeline Lambda Executions & Errors"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "finops-audit-log" ],
+                  [ ".", "ConsumedReadCapacityUnits", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Audit Log Activity"
+              }
+            }
+          ]
+        }
+
+  # ---------------------------------------------------------------------------
+  # Auditor Role (Separation of duties: solitary holder of kms:Decrypt on audit table)
+  # ---------------------------------------------------------------------------
+  AuditorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: FinOpsAuditorRole
+      Description: Read-only auditor role permitted to decrypt sensitive audit details
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FinOpsAuditorDecryptPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt AuditTable.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt FinOpsKey.Arn
+                Condition:
+                  StringLike:
+                    kms:EncryptionContext:tenant_id: '*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt FinOpsKey.Arn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Project
+          Value: finops-demo
+
+Outputs:
+  AuditTableName:
+    Description: DynamoDB Audit Table Name
+    Value: !Ref AuditTable
+
+  FinOpsKeyArn:
+    Description: KMS Key ARN for envelope encryption
+    Value: !GetAtt FinOpsKey.Arn
+
+  EscalationTopicArn:
+    Description: SNS Topic ARN for escalation notifications
+    Value: !Ref EscalationTopic
+
+  ScannerFunctionArn:
+    Description: Scanner Lambda Function ARN
+    Value: !GetAtt ScannerFunction.Arn
+
+  ApprovalFunctionUrl:
+    Description: Free Lambda Function URL endpoint for human approval links
+    Value: !GetAtt ApprovalFunctionUrl.FunctionUrl
+
+  AuditorRoleArn:
+    Description: Auditor IAM Role ARN for decrypting audit records
+    Value: !GetAtt AuditorRole.Arn

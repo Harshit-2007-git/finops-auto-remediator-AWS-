@@ -1,0 +1,20 @@
+{
+  "company": "pixelforge",
+  "display_name": "PixelForge Studios",
+  "overrides": {
+    "env_rules": {
+      "dev": {
+        "allow_auto_remediate": true,
+        "always_escalate": false
+      },
+      "qa": {
+        "allow_auto_remediate": true,
+        "always_escalate": false
+      },
+      "prod": {
+        "allow_auto_remediate": false,
+        "always_escalate": true
+      }
+    }
+  }
+}

@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  FinOps Auto-Remediation Cross-Account Onboarding Template.
+  Deploys least-privilege IAM roles in a customer/tenant account to allow the
+  centralized FinOps Auto-Remediation platform to scan and remediate cloud waste.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Platform Configuration"
+        Parameters:
+          - PlatformAccountId
+          - ExternalId
+      - Label:
+          default: "Security & Scope Configuration"
+        Parameters:
+          - ScopeTagValue
+          - EnableRemediation
+
+Parameters:
+  PlatformAccountId:
+    Type: String
+    Description: The 12-digit AWS Account ID of the centralized FinOps Auto-Remediation platform.
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a valid 12-digit AWS Account ID.
+
+  ExternalId:
+    Type: String
+    NoEcho: true
+    Description: Cryptographically random ExternalId issued during tenant onboarding (min 32 characters).
+    MinLength: 32
+    MaxLength: 128
+    ConstraintDescription: ExternalId must be at least 32 characters long for Confused Deputy protection.
+
+  ScopeTagValue:
+    Type: String
+    Default: finops-demo
+    Description: Tag value required on resources before automated remediation can touch them.
+
+  EnableRemediation:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to provision remediation roles in addition to the read-only scanner role.
+
+  EnableCustomerKmsKey:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to provision a customer-managed KMS key for BYOK envelope encryption (~$1/month prorated).
+
+Conditions:
+  CreateRemediationRoles: !Equals [!Ref EnableRemediation, 'true']
+  CreateCustomerKmsKey: !Equals [!Ref EnableCustomerKmsKey, 'true']
+
+Resources:
+  # -------------------------------------------------------------------------
+  # 1. Read-Only Scanner Role
+  # -------------------------------------------------------------------------
+  FinOpsScannerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: FinOpsScannerRole
+      Description: Read-only cross-account role for scheduled FinOps resource waste scanning.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${PlatformAccountId}:root"
+            Action:
+              - "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !Ref ExternalId
+      Policies:
+        - PolicyName: FinOpsScannerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowCloudWatchAndEC2Read
+                Effect: Allow
+                Action:
+                  - "ec2:DescribeInstances"
+                  - "ec2:DescribeVolumes"
+                  - "ec2:DescribeTags"
+                  - "cloudwatch:GetMetricData"
+                  - "cloudwatch:GetMetricStatistics"
+                Resource: "*"
+              - Sid: DenyPrivilegeEscalationAndStateChanges
+                Effect: Deny
+                Action:
+                  - "iam:*"
+                  - "ec2:RunInstances"
+                  - "ec2:StopInstances"
+                  - "ec2:TerminateInstances"
+                  - "ec2:DeleteVolume"
+                Resource: "*"
+
+  # -------------------------------------------------------------------------
+  # 2. Automated Remediation Role (Denied for env=prod and keep=true)
+  # -------------------------------------------------------------------------
+  FinOpsAutoRemediationRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRemediationRoles
+    Properties:
+      RoleName: FinOpsAutoRemediationRole
+      Description: Cross-account role for high-confidence, low-risk automated remediation (non-prod only).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${PlatformAccountId}:root"
+            Action:
+              - "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !Ref ExternalId
+      Policies:
+        - PolicyName: FinOpsAutoRemediationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowScopedEC2Stop
+                Effect: Allow
+                Action:
+                  - "ec2:StopInstances"
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/Project": !Ref ScopeTagValue
+              - Sid: AllowScopedEBSBackupAndDelete
+                Effect: Allow
+                Action:
+                  - "ec2:CreateSnapshot"
+                Resource:
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:snapshot/*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/Project": !Ref ScopeTagValue
+              - Sid: AllowTaggingNewSnapshotsAndVolumes
+                Effect: Allow
+                Action:
+                  - "ec2:CreateTags"
+                Resource:
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:snapshot/*"
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+              - Sid: AllowScopedEBSDelete
+                Effect: Allow
+                Action:
+                  - "ec2:DeleteVolume"
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/Project": !Ref ScopeTagValue
+              - Sid: DenyProductionAutoRemediation
+                Effect: Deny
+                Action:
+                  - "ec2:StopInstances"
+                  - "ec2:DeleteVolume"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/env": "prod"
+              - Sid: DenyExplicitKeepTag
+                Effect: Deny
+                Action:
+                  - "ec2:StopInstances"
+                  - "ec2:DeleteVolume"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/keep": "true"
+              - Sid: StrictlyDenyEC2Termination
+                Effect: Deny
+                Action:
+                  - "ec2:TerminateInstances"
+                Resource: "*"
+
+  # -------------------------------------------------------------------------
+  # 3. Approved Remediation Role (Allows env=prod with human authorization; denies keep=true)
+  # -------------------------------------------------------------------------
+  FinOpsApprovedRemediationRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRemediationRoles
+    Properties:
+      RoleName: FinOpsApprovedRemediationRole
+      Description: Cross-account role for approved remediation actions (permits verified prod remediations).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${PlatformAccountId}:root"
+            Action:
+              - "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !Ref ExternalId
+      Policies:
+        - PolicyName: FinOpsApprovedRemediationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowScopedEC2Stop
+                Effect: Allow
+                Action:
+                  - "ec2:StopInstances"
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/Project": !Ref ScopeTagValue
+              - Sid: AllowScopedEBSSnapshot
+                Effect: Allow
+                Action:
+                  - "ec2:CreateSnapshot"
+                Resource:
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:snapshot/*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/Project": !Ref ScopeTagValue
+              - Sid: AllowTaggingNewSnapshotsAndVolumes
+                Effect: Allow
+                Action:
+                  - "ec2:CreateTags"
+                Resource:
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:snapshot/*"
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+              - Sid: AllowScopedEBSDelete
+                Effect: Allow
+                Action:
+                  - "ec2:DeleteVolume"
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/Project": !Ref ScopeTagValue
+              - Sid: DenyExplicitKeepTag
+                Effect: Deny
+                Action:
+                  - "ec2:StopInstances"
+                  - "ec2:DeleteVolume"
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/keep": "true"
+              - Sid: StrictlyDenyEC2Termination
+                Effect: Deny
+                Action:
+                  - "ec2:TerminateInstances"
+                Resource: "*"
+
+  # -------------------------------------------------------------------------
+  # 4. Optional Customer-Managed KMS Key (BYOK Envelope Encryption)
+  # -------------------------------------------------------------------------
+  CustomerFinOpsKey:
+    Type: AWS::KMS::Key
+    Condition: CreateCustomerKmsKey
+    Properties:
+      Description: Customer-managed KMS key for BYOK FinOps audit encryption (~$1/month prorated)
+      EnableKeyRotation: false
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: customer-finops-key-policy
+        Statement:
+          - Sid: EnableCustomerRootAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowPlatformTenantEnvelopeEncryption
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${PlatformAccountId}:root'
+            Action:
+              - 'kms:GenerateDataKey*'
+              - 'kms:Decrypt'
+            Resource: '*'
+            Condition:
+              StringLike:
+                kms:EncryptionContext:tenant_id: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ScopeTagValue
+
+Outputs:
+  ScannerRoleArn:
+    Description: ARN of the read-only scanner role to configure in the FinOps console.
+    Value: !GetAtt FinOpsScannerRole.Arn
+
+  AutoRemediationRoleArn:
+    Description: ARN of the automated remediation role (non-prod only).
+    Value: !If [CreateRemediationRoles, !GetAtt FinOpsAutoRemediationRole.Arn, "DISABLED"]
+
+  ApprovedRemediationRoleArn:
+    Description: ARN of the human-approved remediation role (permits approved prod remediations).
+    Value: !If [CreateRemediationRoles, !GetAtt FinOpsApprovedRemediationRole.Arn, "DISABLED"]
+
+  CustomerKmsKeyArn:
+    Condition: CreateCustomerKmsKey
+    Description: Customer KMS Key ARN for BYOK configuration in FinOps wizard
+    Value: !GetAtt CustomerFinOpsKey.Arn

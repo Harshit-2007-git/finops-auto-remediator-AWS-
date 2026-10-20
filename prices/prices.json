@@ -1,0 +1,32 @@
+{
+  "ap-south-1": {
+    "ec2": {
+      "t3.micro": {
+        "on_demand_hourly": 0.0104,
+        "description": "2 vCPU, 1 GiB memory"
+      },
+      "t3.small": {
+        "on_demand_hourly": 0.0209,
+        "description": "2 vCPU, 2 GiB memory"
+      },
+      "t3.medium": {
+        "on_demand_hourly": 0.0418,
+        "description": "2 vCPU, 4 GiB memory"
+      }
+    },
+    "ebs": {
+      "gp3": {
+        "per_gb_monthly": 0.08,
+        "description": "General Purpose SSD"
+      },
+      "gp2": {
+        "per_gb_monthly": 0.10,
+        "description": "General Purpose SSD (previous gen)"
+      }
+    }
+  },
+  "_meta": {
+    "source": "AWS ap-south-1 pricing (October 2024)",
+    "disclaimer": "Prices are approximate projections for demonstration purposes only."
+  }
+}

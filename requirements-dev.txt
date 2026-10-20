@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8.0.0
+moto[all]>=5.0.0
+cfn-lint>=1.0.0

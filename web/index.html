@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Closed-Loop FinOps Auto-Remediation on AWS</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+    <!-- Top Navigation Header -->
+    <header class="app-header">
+        <div class="header-left">
+            <div class="brand-logo">
+                <span class="logo-icon">⚡</span>
+                <span class="brand-name">Closed-Loop <span class="brand-sub">FinOps</span></span>
+            </div>
+            
+            <!-- Connection Mode Badge -->
+            <div id="connectionPill" class="connection-badge mock" onclick="openAwsModal()">
+                <span class="badge-dot"></span>
+                <span id="connectionText">Mode: <strong>Simulation (Mock)</strong></span>
+                <span class="link-hint">⚙ Manage</span>
+            </div>
+
+            <!-- AWS Region Badge -->
+            <div class="region-badge">
+                <span class="aws-icon">☁</span>
+                <span id="currentRegionText">ap-south-1</span>
+            </div>
+        </div>
+
+        <div class="header-right">
+            <!-- Autopilot Toggle -->
+            <div class="env-toggle-wrapper">
+                <span class="toggle-label">Autopilot:</span>
+                <label class="switch">
+                    <input type="checkbox" id="autopilotToggle">
+                    <span class="slider round"></span>
+                </label>
+                <span id="autopilotStatus" class="status-pill">OFF</span>
+            </div>
+
+            <!-- Dry Run Toggle -->
+            <div class="env-toggle-wrapper">
+                <span class="toggle-label">Dry Run:</span>
+                <label class="switch">
+                    <input type="checkbox" id="dryRunToggle" checked>
+                    <span class="slider round"></span>
+                </label>
+                <span id="dryRunStatus" class="status-pill active">ENABLED</span>
+            </div>
+
+            <!-- Connect Real Account Button -->
+            <button id="btnOpenAwsModal" class="btn btn-connect" onclick="openAwsModal()">
+                <span class="btn-icon">🔗</span> Link AWS Account
+            </button>
+
+            <!-- Reset Demo Cloud (only visible in mock mode) -->
+            <button id="btnSeed" class="btn btn-secondary">
+                <span class="btn-icon">↺</span> Reset Demo Cloud
+            </button>
+
+            <!-- Run Scan Button -->
+            <button id="btnRunScan" class="btn btn-primary">
+                <span class="btn-icon">▶</span> Run Scheduled Scan
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="main-container">
+        <!-- Live Connection Notice Banner (When in Real AWS Mode) -->
+        <div id="realAwsBanner" class="real-aws-banner" style="display: none;">
+            <div class="banner-content">
+                <span class="banner-icon">⚡</span>
+                <div>
+                    <strong>Connected to Live AWS Account: <span id="bannerAccountId">Loading...</span></strong>
+                    <p>Scanning real AWS resources in <span id="bannerRegion">ap-south-1</span>. Identity: <code id="bannerArn">-</code></p>
+                </div>
+            </div>
+            <button class="btn btn-secondary btn-sm" onclick="disconnectRealAws()">Disconnect & Return to Mock</button>
+        </div>
+
+        <!-- Hero Stats Row -->
+        <section class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-title">Projected Monthly Waste</span>
+                    <span class="stat-badge danger">Potential</span>
+                </div>
+                <div class="stat-value" id="statMonthlySavings">$0.00</div>
+                <div class="stat-footer">
+                    <span class="stat-sub">Realized Savings: <strong id="statRealizedSavings" style="color: #10B981;">$0.00</strong>/mo</span>
+                </div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-title">Flagged Resources</span>
+                    <span class="stat-badge warning">Findings</span>
+                </div>
+                <div class="stat-value" id="statFlaggedCount">0</div>
+                <div class="stat-footer">
+                    <span class="stat-sub"><span id="statEc2Count">0</span> EC2 &nbsp;•&nbsp; <span id="statEbsCount">0</span> EBS</span>
+                </div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-title">Remediated Actions</span>
+                    <span class="stat-badge success">Safe Closed-Loop</span>
+                </div>
+                <div class="stat-value" id="statRemediatedCount">0</div>
+                <div class="stat-footer">
+                    <span class="stat-sub"><span id="statSimulatedActions">0</span> Simulated &nbsp;•&nbsp; <span id="statRealActions">0</span> Live AWS</span>
+                </div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span class="stat-title">Pending Human Approval</span>
+                    <span class="stat-badge purple">HMAC Signed</span>
+                </div>
+                <div class="stat-value" id="statEscalatedCount">0</div>
+                <div class="stat-footer">
+                    <span class="stat-sub">High-Risk / Prod Escalations</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Main Workspace Tabs -->
+        <section class="workspace-section">
+            <div class="workspace-tabs">
+                <button class="tab-btn active" data-tab="tab-findings">
+                    <span>🔍 Waste Findings & Decisions</span>
+                    <span class="tab-count" id="findingsCountBadge">0</span>
+                </button>
+                <button class="tab-btn" data-tab="tab-audit">
+                    <span>🔐 KMS Envelope Encrypted Audit Log</span>
+                    <span class="tab-count" id="auditCountBadge">0</span>
+                </button>
+                <button class="tab-btn" data-tab="tab-architecture">
+                    <span>📐 Closed-Loop Architecture & Policy</span>
+                </button>
+            </div>
+
+            <!-- Tab 1: Findings & Decisions Table -->
+            <div id="tab-findings" class="tab-content active">
+                <div class="section-toolbar">
+                    <div class="toolbar-title">
+                        <h2>Detected Cloud Waste Findings</h2>
+                        <p class="section-desc">Evaluated through multi-factor decision matrix (Confidence × Risk) with safety overrides.</p>
+                    </div>
+                    <div class="toolbar-actions">
+                        <button id="btnAutoRemediateAll" class="btn btn-outline-success">
+                            <span>⚡ Retry Failed Actions</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="table-card">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Resource ID</th>
+                                <th>Type</th>
+                                <th>Env</th>
+                                <th>Owner</th>
+                                <th>Idle Duration</th>
+                                <th>CPU %</th>
+                                <th>Est. Cost</th>
+                                <th>Confidence</th>
+                                <th>Risk</th>
+                                <th>Decision</th>
+                                <th>Why Decision / Reason</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="findingsTableBody">
+                            <tr class="empty-row">
+                                <td colspan="11">
+                                    <div class="empty-state">
+                                        <span class="empty-icon">☁</span>
+                                        <p>No active scan results yet. Click <strong>"Run Scheduled Scan"</strong> to inspect cloud resources.</p>
+                                    </div>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Tab 2: Encrypted DynamoDB Audit Log -->
+            <div id="tab-audit" class="tab-content">
+                <div class="section-toolbar">
+                    <div class="toolbar-title">
+                        <h2>DynamoDB KMS Envelope-Encrypted Audit Trail</h2>
+                        <p class="section-desc">Every remediation and escalation decision is encrypted with AES-256-GCM via KMS GenerateDataKey before persistence.</p>
+                    </div>
+                    <div class="toolbar-actions">
+                        <div class="crypto-view-toggle">
+                            <span class="toggle-label">View Mode:</span>
+                            <button id="btnViewDecrypted" class="btn-toggle active">Decrypted View</button>
+                            <button id="btnViewCiphertext" class="btn-toggle">Raw KMS Ciphertext</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="table-card">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Log ID</th>
+                                <th>Timestamp (UTC)</th>
+                                <th>Resource ID</th>
+                                <th>Action Taken</th>
+                                <th>KMS Key</th>
+                                <th>Payload Inspection</th>
+                            </tr>
+                        </thead>
+                        <tbody id="auditTableBody">
+                            <tr class="empty-row">
+                                <td colspan="6">
+                                    <div class="empty-state">
+                                        <span class="empty-icon">🔒</span>
+                                        <p>Audit log is currently empty. Trigger scans or remediations to record encrypted provenance.</p>
+                                    </div>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Tab 3: Architecture & Decision Rules -->
+            <div id="tab-architecture" class="tab-content">
+                <div class="architecture-grid">
+                    <div class="card card-blueprint">
+                        <h3>Closed-Loop Remediation Sequence</h3>
+                        <p class="card-desc">Serverless event-driven workflow on AWS Free Tier</p>
+                        <div class="flow-steps">
+                            <div class="flow-step">
+                                <span class="step-num">1</span>
+                                <div class="step-info">
+                                    <strong>EventBridge Cron</strong>
+                                    <span>Triggers scheduled scan daily without cost</span>
+                                </div>
+                            </div>
+                            <div class="flow-step">
+                                <span class="step-num">2</span>
+                                <div class="step-info">
+                                    <strong>Scanner Lambda</strong>
+                                    <span>Queries CloudWatch CPU metrics & volume states</span>
+                                </div>
+                            </div>
+                            <div class="flow-step">
+                                <span class="step-num">3</span>
+                                <div class="step-info">
+                                    <strong>Policy Engine</strong>
+                                    <span>Evaluates Confidence × Risk matrix + circuit breaker</span>
+                                </div>
+                            </div>
+                            <div class="flow-step">
+                                <span class="step-num">4</span>
+                                <div class="step-info">
+                                    <strong>Remediator / Escalator</strong>
+                                    <span>Auto-stops Dev resources; sends HMAC signed email for Prod</span>
+                                </div>
+                            </div>
+                            <div class="flow-step">
+                                <span class="step-num">5</span>
+                                <div class="step-info">
+                                    <strong>KMS Envelope Encryption</strong>
+                                    <span>Encrypts all decision details into DynamoDB</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card card-matrix">
+                        <h3>Multi-Account & Real Cloud Support</h3>
+                        <div class="matrix-table-wrapper">
+                            <table class="matrix-table">
+                                <thead>
+                                    <tr>
+                                        <th>Feature</th>
+                                        <th>Simulation Mode</th>
+                                        <th>Live Real AWS Mode</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td><strong>Credentials</strong></td>
+                                        <td>Zero credentials required (moto)</td>
+                                        <td>Cross-Account IAM Role (or AWS CLI profile)</td>
+                                    </tr>
+                                    <tr>
+                                        <td><strong>Target Account</strong></td>
+                                        <td>Mock PixelForge Studios tenant</td>
+                                        <td>ANY real AWS Account (12-digit ID)</td>
+                                    </tr>
+                                    <tr>
+                                        <td><strong>Action Execution</strong></td>
+                                        <td>Stops mock EC2 instances</td>
+                                        <td>Real <code>ec2:StopInstances</code> on idle instances</td>
+                                    </tr>
+                                    <tr>
+                                        <td><strong>Cost Guardrail</strong></td>
+                                        <td>$0.00</td>
+                                        <td>Free Tier friendly (~$1/mo KMS CMK prorated)</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="guardrails-list">
+                            <h4>Safety Guards & Cost Guardrails</h4>
+                            <ul>
+                                <li><strong>Scope Tag Guard:</strong> Choose between strict <code>Project=finops-demo</code> scope or region-wide scan.</li>
+                                <li><strong>Prod Override Guard:</strong> Production environments (<code>env=prod</code>) are NEVER auto-stopped without approval.</li>
+                                <li><strong>Circuit Breaker:</strong> Maximum 5 auto-remediations per run before tripping to prevent runaway actions.</li>
+                                <li><strong>Dry Run Mode:</strong> Always enabled by default to safely preview actions before committing live remediations.</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Modal 1: Link AWS Account Modal -->
+    <div id="awsModal" class="modal-backdrop">
+        <div class="modal-dialog modal-md">
+            <div class="modal-header">
+                <h3>🔗 Multi-Tenant AWS Account Linking</h3>
+                <button class="modal-close-btn" onclick="closeAwsModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="modal-desc">Connect customer/tenant AWS accounts using secure cross-account IAM roles with ExternalId protection and least-privilege verification. No permanent keys are ever stored.</p>
+                
+                <!-- Section A: Onboard New Tenant -->
+                <div class="onboarding-section" style="background: rgba(30, 41, 59, 0.6); padding: 14px; border-radius: 8px; border: 1px solid #334155; margin-bottom: 16px;">
+                    <h4 style="margin: 0 0 8px 0; font-size: 13px; color: #38BDF8;">Step 1: Onboard Tenant (Generate ExternalId)</h4>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="text" id="inputOnboardTenantName" class="form-input flex-1" placeholder="e.g. PixelForge Studios or ClientAlpha" value="PixelForge Studios">
+                        <button type="button" class="btn btn-secondary" onclick="handleOnboardTenant()" style="white-space: nowrap;">Generate Package</button>
+                    </div>
+                    <div id="onboardResultBox" style="display: none; margin-top: 10px; font-size: 11px; color: #94A3B8; background: #0F172A; padding: 10px; border-radius: 6px;">
+                        <div>Platform Account ID: <code id="onboardPlatformAccount" style="color: #38BDF8;">-</code></div>
+                        <div style="margin-top: 4px;">Issued ExternalId: <code id="onboardExternalId" style="color: #4ADE80; word-break: break-all;">-</code></div>
+                        <div style="margin-top: 4px;">CloudFormation Template: <span style="color: #F8FAFC;">onboarding/finops-cross-account-role.yaml</span></div>
+                    </div>
+                </div>
+
+                <!-- Section B: Connect via AssumeRole -->
+                <h4 style="margin: 0 0 8px 0; font-size: 13px; color: #E2E8F0;">Step 2: Connect Tenant via Cross-Account Role</h4>
+                <div class="form-group">
+                    <label class="form-label">Connection Mode:</label>
+                    <div class="radio-group">
+                        <label class="radio-label">
+                            <input type="radio" name="authMethod" value="role" checked onchange="toggleAuthFields()">
+                            <span>Cross-Account IAM Role (AssumeRole + ExternalId)</span>
+                        </label>
+                        <label class="radio-label">
+                            <input type="radio" name="authMethod" value="profile" onchange="toggleAuthFields()">
+                            <span>Local Platform CLI Profile</span>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Cross-Account Role Input Fields -->
+                <div id="roleFields" class="form-fields-group">
+                    <div class="form-row">
+                        <div class="form-group flex-1">
+                            <label class="form-label">Tenant ID:</label>
+                            <input type="text" id="inputConnectTenantId" class="form-input" placeholder="e.g. pixelforge" value="pixelforge">
+                        </div>
+                        <div class="form-group flex-1">
+                            <label class="form-label">External ID (min 32 chars):</label>
+                            <input type="text" id="inputExternalId" class="form-input" placeholder="Shared secret from Step 1">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">FinOps Scanner Role ARN:</label>
+                        <input type="text" id="inputRoleArn" class="form-input" placeholder="arn:aws:iam::123456789012:role/FinOpsScannerRole">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Remediation Role ARN (Optional):</label>
+                        <input type="text" id="inputRemediationRoleArn" class="form-input" placeholder="arn:aws:iam::123456789012:role/FinOpsAutoRemediationRole (optional)">
+                    </div>
+                </div>
+
+                <!-- Section C: Encrypt My Data with KMS (Required for Real Accounts) -->
+                <div class="kms-section" style="background: rgba(30, 41, 59, 0.6); padding: 14px; border-radius: 8px; border: 1px solid #334155; margin-bottom: 16px;">
+                    <h4 style="margin: 0 0 8px 0; font-size: 13px; color: #38BDF8;">Step 3: Encrypt My Data with KMS (Required for Real Accounts)</h4>
+                    <div class="form-group" style="margin-bottom: 8px;">
+                        <div class="radio-group" style="display: flex; flex-direction: column; gap: 8px;">
+                            <label class="radio-label">
+                                <input type="radio" name="kmsOption" value="platform" checked onchange="toggleKmsFields()">
+                                <span>Platform Shared Key (Default, free-demo friendly, isolated via <code>tenant_id</code> EncryptionContext)</span>
+                            </label>
+                            <label class="radio-label">
+                                <input type="radio" name="kmsOption" value="byok" onchange="toggleKmsFields()">
+                                <span>Bring Your Own Key — BYOK (Customer-managed CMK in your account, ~$1/mo prorated)</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div id="byokKeyFields" style="display: none; margin-top: 8px;">
+                        <label class="form-label" style="font-size: 12px;">Customer KMS Key ARN:</label>
+                        <input type="text" id="inputByokKeyArn" class="form-input" placeholder="arn:aws:kms:region:account:key/uuid from CustomerKmsKeyArn stack output">
+                        <small style="color: #94A3B8; font-size: 11px; display: block; margin-top: 4px;">You retain full control and can revoke platform access anytime by disabling this key in AWS KMS.</small>
+                    </div>
+                </div>
+
+                <!-- Region & Options -->
+                <div class="form-row">
+                    <div class="form-group flex-1">
+                        <label class="form-label">AWS Region:</label>
+                        <select id="selectRegion" class="form-select">
+                            <option value="ap-south-1" selected>ap-south-1 (Mumbai)</option>
+                            <option value="us-east-1">us-east-1 (N. Virginia)</option>
+                            <option value="us-east-2">us-east-2 (Ohio)</option>
+                            <option value="us-west-2">us-west-2 (Oregon)</option>
+                            <option value="eu-west-1">eu-west-1 (Ireland)</option>
+                            <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
+                        </select>
+                    </div>
+                    <div class="form-group flex-1">
+                        <label class="form-label">Resource Scope Filter:</label>
+                        <select id="selectScope" class="form-select" onchange="handleScopeChange()">
+                            <option value="tagged" selected>Safe: Only Tagged (Project=finops-demo)</option>
+                            <option value="all">Scope: ALL Resources (Forces Dry-Run & Escalate-Only)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Scope All Safety Warning -->
+                <div id="scopeAllWarning" style="display: none; margin-bottom: 12px; font-size: 11px; color: #F59E0B; background: rgba(245, 158, 11, 0.1); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(245, 158, 11, 0.3);">
+                    ⚠️ <strong>Safety Guard Active:</strong> Scanning ALL resources forces Dry-Run mode and Escalate-Only policy. Automated remediations are strictly disallowed on untagged resources.
+                </div>
+
+                <!-- Status Feedback Box -->
+                <div id="awsConnectionFeedback" class="connection-feedback" style="display: none;"></div>
+
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" onclick="testAwsConnection()">Test Role & Least Privilege</button>
+                    <button class="btn btn-primary" onclick="connectAwsAccount()">Connect & Switch to Tenant</button>
+                    <button class="btn btn-secondary" onclick="disconnectRealAws()">Reset to Mock</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal 2: Audit Record Inspection -->
+    <div id="detailModal" class="modal-backdrop">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <h3 id="modalTitle">Audit Record Details</h3>
+                <button id="modalClose" class="modal-close-btn" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <pre id="modalJsonContent" class="code-block"></pre>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toastContainer" class="toast-container"></div>
+
+    <script src="/app.js"></script>
+</body>
+</html>
